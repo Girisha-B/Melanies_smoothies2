@@ -3,8 +3,8 @@ import streamlit as st
 from snowflake.snowpark.functions import col
 import requests
 import pandas as pd
+import math
 
-# App title
 st.title("🥤 Customize Your Smoothie 🥤")
 st.write("Choose the fruits you want in your custom smoothie")
 
@@ -17,43 +17,76 @@ cnx = st.connection("snowflake")
 session = cnx.session()
 
 # Fetch fruit options from Snowflake
-my_dataframe = session.table("smoothies.public.fruit_options").select(
+snow_df = session.table("smoothies.public.fruit_options").select(
     col("FRUIT_NAME"), col("SEARCH_ON")
 )
 
-# Convert Snowpark DataFrame to Pandas
-pd_df = my_dataframe.to_pandas()
+# Convert Snowpark DataFrame to Pandas and index by FRUIT_NAME for fast lookup
+pd_df = snow_df.to_pandas().drop_duplicates(subset=["FRUIT_NAME"])
+pd_df = pd_df.set_index("FRUIT_NAME", drop=False)
 
-# Use fruit names as choices in multiselect
-Ingredients_list = st.multiselect(
-    "Choose up to 5 ingredients:", pd_df["FRUIT_NAME"].tolist(), max_selections=5
+# Multiselect on fruit names
+ingredients_list = st.multiselect(
+    "Choose up to 5 ingredients:",
+    options=pd_df["FRUIT_NAME"].tolist(),
+    max_selections=5
 )
 
-if Ingredients_list:
-    Ingredients_string = ""
+if ingredients_list:
+    # Build a nice comma-separated list for storage
+    ingredients_string = ", ".join(ingredients_list)
 
-    for fruit_chosen in Ingredients_list:
-        Ingredients_string += fruit_chosen + " "
+    for fruit_chosen in ingredients_list:
+        # Ensure the chosen fruit exists in the dataframe
+        if fruit_chosen not in pd_df.index:
+            st.warning(f"'{fruit_chosen}' not found in options. Skipping.")
+            continue
 
-        # Lookup search key from pandas dataframe
-        search_on = pd_df.loc[pd_df["FRUIT_NAME"] == fruit_chosen, "SEARCH_ON"].iloc[0]
+        # Get search key and CAST TO STRING safely
+        search_on_value = pd_df.at[fruit_chosen, "SEARCH_ON"]
+
+        # Guard against NaN/None
+        if search_on_value is None or (isinstance(search_on_value, float) and math.isnan(search_on_value)):
+            st.warning(f"No SEARCH_ON value for '{fruit_chosen}'. Skipping nutrition lookup.")
+            continue
+
+        search_on = str(search_on_value).strip()
+        if not search_on:
+            st.warning(f"Empty SEARCH_ON for '{fruit_chosen}'. Skipping.")
+            continue
 
         # Show nutrition info
-        st.subheader(fruit_chosen + " Nutrition Information")
-        smoothiefroot_response = requests.get(
-            "https://my.smoothiefroot.com/api/fruit/" + search_on
-        )
-        st.dataframe(data=smoothiefroot_response.json(), use_container_width=True)
+        st.subheader(f"{fruit_chosen} — Nutrition Information")
+        url = f"https://my.smoothiefroot.com/api/fruit/{search_on}"
 
-    # Insert order into Snowflake
-    my_insert_stmt = f"""
-        INSERT INTO smoothies.public.orders(ingredients, NAME_ON_ORDER)
-        VALUES ('{Ingredients_string.strip()}', '{name_on_order}')
+        try:
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Normalize JSON to a dataframe for display
+            if isinstance(data, dict):
+                df = pd.json_normalize(data)
+            else:
+                df = pd.DataFrame(data)
+
+            st.dataframe(df, use_container_width=True)
+        except Exception as e:
+            st.error(f"Failed to fetch nutrition for {fruit_chosen}: {e}")
+
+    # Prepare and execute insert (escape single quotes)
+    name_sql = name_on_order.replace("'", "''")
+    ingredients_sql = ingredients_string.replace("'", "''")
+
+    insert_sql = f"""
+        INSERT INTO smoothies.public.orders (ingredients, NAME_ON_ORDER)
+        VALUES ('{ingredients_sql}', '{name_sql}')
     """
 
-    st.write(my_insert_stmt)
-    time_to_insert = st.button("Submit Order")
-
-    if time_to_insert:
-        session.sql(my_insert_stmt).collect()
-        st.success("Your Smoothie is ordered!", icon="✅")
+    st.code(insert_sql, language="sql")
+    if st.button("Submit Order"):
+        try:
+            session.sql(insert_sql).collect()
+            st.success("Your Smoothie is ordered!", icon="✅")
+        except Exception as e:
+            st.error(f"Insert failed: {e}")
